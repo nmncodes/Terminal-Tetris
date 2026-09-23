@@ -620,7 +620,7 @@ public:
             fill(screen.begin(), screen.end(), emptyCell);
             int goY = max(0, nScreenHeight / 2 - 4);
             int goX = max(0, (nScreenWidth - 32) / 2);
-            DrawString(goX, goY,     L"+------------------------------+", COLOR_RED);
+            DrawString(goX, goY,     L"$------------------------------$", COLOR_RED);
             DrawString(goX, goY + 1, L"|         GAME OVER!           |", COLOR_RED);
             wchar_t szFinal[40];
             wsprintfW(szFinal, L"|   Final Score: %-13d |", nScore);
@@ -632,7 +632,7 @@ public:
             DrawString(goX, goY + 5, L"|                              |", COLOR_WHITE);
             DrawString(goX, goY + 6, L"|  'R' to Play Again           |", COLOR_WHITE);
             DrawString(goX, goY + 7, L"|  'Q' to Quit                 |", COLOR_WHITE);
-            DrawString(goX, goY + 8, L"+------------------------------+", COLOR_RED);
+            DrawString(goX, goY + 8, L"$------------------------------$", COLOR_RED);
             RenderFrame();
 
             // Wait for R to restart or Q to quit
