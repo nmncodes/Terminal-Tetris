@@ -1,19 +1,21 @@
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
 #include <iostream>
 #include <vector>
 #include <string>
 #include <chrono>
 #include <fstream>
-#include <time.h>
-#include <stdio.h>
+#include <ctime>
+#include <cstdio>
 #include <algorithm>
-#include <Windows.h>
 
 using namespace std;
 
 constexpr int FIELD_WIDTH = 12;
 constexpr int FIELD_HEIGHT = 18;
 constexpr int MIN_LAYOUT_WIDTH = 52;
-constexpr int MIN_LAYOUT_HEIGHT = 22;
+constexpr int MIN_LAYOUT_HEIGHT = 24;
 
 // Console Color Definitions
 constexpr WORD COLOR_BLACK        = 0;
@@ -55,13 +57,22 @@ private:
     HANDLE hConsole = NULL;
     HANDLE hOriginalConsole = NULL;
 
+    // 7-Bag Randomizer
+    int bag[7];
+    int bagIndex = 7;
+
     int nCurrentPiece = 0;
     int nNextPiece = 0;
     int nHoldPiece = -1;
     bool bCanHold = true;
+
+    // Input state & DAS (Delayed Auto Shift)
     bool bHoldKeyHold = true;
     bool bSpaceKeyHold = true;
     bool bPauseKeyHold = true;
+    bool bRotateHold = true;
+    int nLeftHoldCount = 0;
+    int nRightHoldCount = 0;
 
     int nCurrentRotation = 0;
     int nCurrentX = 0;
@@ -76,8 +87,6 @@ private:
     vector<int> vLines;
     bool bGameOver = false;
     bool bPaused = false;
-    bool bRotateHold = true;
-    bool bKey[4];
 
     int LoadHighScore() {
         ifstream file("highscore.dat");
@@ -91,9 +100,22 @@ private:
         if (file) file << hs;
     }
 
+    int GetNextTetromino() {
+        if (bagIndex >= 7) {
+            for (int i = 0; i < 7; i++) bag[i] = i;
+            for (int i = 6; i > 0; i--) {
+                int j = rand() % (i + 1);
+                swap(bag[i], bag[j]);
+            }
+            bagIndex = 0;
+        }
+        return bag[bagIndex++];
+    }
+
     int Rotate(int px, int py, int r) {
         int pi = 0;
-        switch (r % 4) {
+        int rot = (r % 4 + 4) % 4;
+        switch (rot) {
         case 0: pi = py * 4 + px;           break; // 0 degrees
         case 1: pi = 12 + py - (px * 4);    break; // 90 degrees
         case 2: pi = 15 - (py * 4) - px;    break; // 180 degrees
@@ -106,11 +128,17 @@ private:
         for (int px = 0; px < 4; px++) {
             for (int py = 0; py < 4; py++) {
                 int pi = Rotate(px, py, nRotation);
-                int fi = (nPosY + py) * FIELD_WIDTH + (nPosX + px);
+                if (tetromino[nTetromino][pi] != L'.') {
+                    int fx = nPosX + px;
+                    int fy = nPosY + py;
 
-                if (nPosX + px >= 0 && nPosX + px < FIELD_WIDTH) {
-                    if (nPosY + py >= 0 && nPosY + py < FIELD_HEIGHT) {
-                        if (tetromino[nTetromino][pi] != L'.' && pField[fi] != 0)
+                    // Bounds check: must be strictly inside horizontal boundaries and above bottom floor
+                    if (fx < 0 || fx >= FIELD_WIDTH || fy >= FIELD_HEIGHT)
+                        return false;
+
+                    // If within field vertically, check for collision with walls or locked blocks
+                    if (fy >= 0) {
+                        if (pField[fy * FIELD_WIDTH + fx] != 0)
                             return false;
                     }
                 }
@@ -144,11 +172,14 @@ private:
                 winH = csbi.dwSize.Y;
             }
 
-            // Ensure buffer covers the window area
-            if (csbi.dwSize.X < winW || csbi.dwSize.Y < winH) {
+            SHORT requiredW = static_cast<SHORT>(csbi.srWindow.Left + winW);
+            SHORT requiredH = static_cast<SHORT>(csbi.srWindow.Top + winH);
+
+            // Ensure buffer covers the window viewport
+            if (csbi.dwSize.X < requiredW || csbi.dwSize.Y < requiredH) {
                 COORD newSize = {
-                    static_cast<SHORT>(max(static_cast<int>(csbi.dwSize.X), winW)),
-                    static_cast<SHORT>(max(static_cast<int>(csbi.dwSize.Y), winH))
+                    max(csbi.dwSize.X, requiredW),
+                    max(csbi.dwSize.Y, requiredH)
                 };
                 SetConsoleScreenBufferSize(hConsole, newSize);
                 GetConsoleScreenBufferInfo(hConsole, &csbi);
@@ -186,6 +217,227 @@ private:
         DrawCell(x + 1, y, tile2[1], attr);
     }
 
+    void DrawPiecePreview(int startX, int startY, int pieceId) {
+        if (pieceId < 0 || pieceId >= 7) return;
+        for (int py = 0; py < 4; py++) {
+            for (int px = 0; px < 4; px++) {
+                if (tetromino[pieceId][py * 4 + px] != L'.') {
+                    DrawTile(startX + px * 2, startY + py, L"[]", PIECE_COLORS[pieceId]);
+                }
+            }
+        }
+    }
+
+    void DrawGameScene(bool bDrawActivePiece = true) {
+        // Clear screen buffer
+        CHAR_INFO emptyCell;
+        emptyCell.Char.UnicodeChar = L' ';
+        emptyCell.Attributes = COLOR_WHITE;
+        fill(screen.begin(), screen.end(), emptyCell);
+
+        int boardCharWidth = FIELD_WIDTH * 2;
+        int totalLayoutWidth = 51;
+        int totalLayoutHeight = 23;
+        int nOffsetX = max(0, (nScreenWidth - totalLayoutWidth) / 2);
+        int nOffsetY = max(0, (nScreenHeight - totalLayoutHeight) / 2);
+
+        int nBoardOffsetX = nOffsetX;
+        int nBoardOffsetY = nOffsetY + 2;
+
+        // Draw Field (walls and locked blocks)
+        for (int x = 0; x < FIELD_WIDTH; x++) {
+            for (int y = 0; y < FIELD_HEIGHT; y++) {
+                int sx = nBoardOffsetX + x * 2;
+                int sy = nBoardOffsetY + y;
+                unsigned char val = pField[y * FIELD_WIDTH + x];
+
+                if (val == 9) { // Border wall
+                    if (y == FIELD_HEIGHT - 1) {
+                        if (x == 0) {
+                            DrawTile(sx, sy, L"<!", COLOR_GRAY);
+                        } else if (x == FIELD_WIDTH - 1) {
+                            DrawTile(sx, sy, L"!>", COLOR_GRAY);
+                        } else {
+                            DrawTile(sx, sy, L"==", COLOR_GRAY);
+                        }
+                    } else if (x == 0) {
+                        DrawTile(sx, sy, L"<!", COLOR_GRAY);
+                    } else {
+                        DrawTile(sx, sy, L"!>", COLOR_GRAY);
+                    }
+                } else if (val == 8) { // Line clear flash
+                    DrawTile(sx, sy, L"==", COLOR_WHITE);
+                } else if (val >= 1 && val <= 7) { // Locked piece
+                    DrawTile(sx, sy, L"[]", PIECE_COLORS[val - 1]);
+                } else {
+                    DrawTile(sx, sy, L"  ", COLOR_BLACK);
+                }
+            }
+        }
+
+        if (bDrawActivePiece && !bGameOver) {
+            // Draw Ghost Piece (Shadow)
+            int nGhostY = nCurrentY;
+            while (DoesPieceFit(nCurrentPiece, nCurrentRotation, nCurrentX, nGhostY + 1)) {
+                nGhostY++;
+            }
+
+            if (nGhostY > nCurrentY) {
+                for (int px = 0; px < 4; px++) {
+                    for (int py = 0; py < 4; py++) {
+                        if (tetromino[nCurrentPiece][Rotate(px, py, nCurrentRotation)] != L'.') {
+                            int sx = nBoardOffsetX + (nCurrentX + px) * 2;
+                            int sy = nBoardOffsetY + (nGhostY + py);
+                            DrawTile(sx, sy, L"::", COLOR_DARK_GRAY);
+                        }
+                    }
+                }
+            }
+
+            // Draw Active Piece
+            for (int px = 0; px < 4; px++) {
+                for (int py = 0; py < 4; py++) {
+                    if (tetromino[nCurrentPiece][Rotate(px, py, nCurrentRotation)] != L'.') {
+                        int sx = nBoardOffsetX + (nCurrentX + px) * 2;
+                        int sy = nBoardOffsetY + (nCurrentY + py);
+                        DrawTile(sx, sy, L"[]", PIECE_COLORS[nCurrentPiece]);
+                    }
+                }
+            }
+        }
+
+        // Draw Side HUD
+        int hudX = nOffsetX + boardCharWidth + 2;
+        int hudY = nOffsetY;
+
+        DrawString(hudX, hudY,     L"+=======================+", COLOR_CYAN);
+        DrawString(hudX, hudY + 1, L"|      T E T R I S      |", COLOR_YELLOW);
+        DrawString(hudX, hudY + 2, L"+=======================+", COLOR_CYAN);
+
+        wchar_t szInfo[32];
+        wsprintfW(szInfo, L" SCORE: %15d ", nScore);
+        DrawString(hudX, hudY + 3, szInfo, COLOR_WHITE);
+
+        wsprintfW(szInfo, L" HIGH:  %15d ", nHighScore);
+        DrawString(hudX, hudY + 4, szInfo, COLOR_YELLOW);
+
+        wsprintfW(szInfo, L" LINES: %15d ", nLinesCleared);
+        DrawString(hudX, hudY + 5, szInfo, COLOR_GREEN);
+
+        wsprintfW(szInfo, L" SPEED: %15d ", 21 - nSpeed);
+        DrawString(hudX, hudY + 6, szInfo, COLOR_CYAN);
+
+        // NEXT & HOLD Side-by-Side Preview Boxes (Full 4x4)
+        DrawString(hudX, hudY + 7,  L"+----------+ +----------+", COLOR_GRAY);
+        DrawString(hudX, hudY + 8,  L"|   NEXT   | |   HOLD   |", COLOR_WHITE);
+        DrawString(hudX, hudY + 9,  L"|          | |          |", COLOR_GRAY);
+        DrawString(hudX, hudY + 10, L"|          | |          |", COLOR_GRAY);
+        DrawString(hudX, hudY + 11, L"|          | |          |", COLOR_GRAY);
+        DrawString(hudX, hudY + 12, L"|          | |          |", COLOR_GRAY);
+        DrawString(hudX, hudY + 13, L"+----------+ +----------+", COLOR_GRAY);
+
+        // Render full 4x4 preview for NEXT
+        DrawPiecePreview(hudX + 2, hudY + 9, nNextPiece);
+
+        // Render full 4x4 preview for HOLD
+        if (nHoldPiece != -1) {
+            DrawPiecePreview(hudX + 15, hudY + 9, nHoldPiece);
+        } else {
+            DrawString(hudX + 17, hudY + 10, L"NONE", COLOR_DARK_GRAY);
+        }
+
+        DrawString(hudX, hudY + 14, L"-------------------------", COLOR_DARK_GRAY);
+        DrawString(hudX, hudY + 15, L" <-/-> / A/D : Move", COLOR_WHITE);
+        DrawString(hudX, hudY + 16, L" DOWN  / S   : Soft Drop", COLOR_WHITE);
+        DrawString(hudX, hudY + 17, L" SPACE       : Hard Drop", COLOR_YELLOW);
+        DrawString(hudX, hudY + 18, L" UP / W / Z  : Rotate", COLOR_WHITE);
+        DrawString(hudX, hudY + 19, L" C / H       : Hold Piece", COLOR_CYAN);
+        DrawString(hudX, hudY + 20, L" P           : Pause", COLOR_WHITE);
+        DrawString(hudX, hudY + 21, L" Q / ESC     : Quit", COLOR_RED);
+        DrawString(hudX, hudY + 22, L"-------------------------", COLOR_DARK_GRAY);
+    }
+
+    void LockPieceAndSpawn() {
+        nPieceCount++;
+        if (nPieceCount % 40 == 0) {
+            if (nSpeed > 2) nSpeed--;
+        }
+
+        // 1. Lock active piece into pField
+        for (int px = 0; px < 4; px++) {
+            for (int py = 0; py < 4; py++) {
+                if (tetromino[nCurrentPiece][Rotate(px, py, nCurrentRotation)] != L'.') {
+                    int fx = nCurrentX + px;
+                    int fy = nCurrentY + py;
+                    if (fx >= 0 && fx < FIELD_WIDTH && fy >= 0 && fy < FIELD_HEIGHT) {
+                        pField[fy * FIELD_WIDTH + fx] = nCurrentPiece + 1;
+                    }
+                }
+            }
+        }
+
+        // 2. Check for completed lines
+        vLines.clear();
+        for (int py = 0; py < 4; py++) {
+            int fy = nCurrentY + py;
+            if (fy >= 0 && fy < FIELD_HEIGHT - 1) {
+                bool bLine = true;
+                for (int px = 1; px < FIELD_WIDTH - 1; px++) {
+                    if (pField[fy * FIELD_WIDTH + px] == 0) {
+                        bLine = false;
+                        break;
+                    }
+                }
+                if (bLine) {
+                    for (int px = 1; px < FIELD_WIDTH - 1; px++)
+                        pField[fy * FIELD_WIDTH + px] = 8;
+                    vLines.push_back(fy);
+                }
+            }
+        }
+
+        // 3. Scoring
+        nScore += 25;
+        if (!vLines.empty()) {
+            nScore += (1 << vLines.size()) * 100;
+            nLinesCleared += static_cast<int>(vLines.size());
+        }
+
+        if (nScore > nHighScore) {
+            nHighScore = nScore;
+            SaveHighScore(nHighScore);
+        }
+
+        // 4. Animate line completion flash and shift before spawning next piece
+        if (!vLines.empty()) {
+            DrawGameScene(false);
+            RenderFrame();
+            Sleep(250);
+
+            for (auto& v : vLines) {
+                for (int px = 1; px < FIELD_WIDTH - 1; px++) {
+                    for (int py = v; py > 0; py--)
+                        pField[py * FIELD_WIDTH + px] = pField[(py - 1) * FIELD_WIDTH + px];
+                    pField[px] = 0;
+                }
+            }
+            vLines.clear();
+        }
+
+        // 5. Spawn next piece
+        nCurrentX = FIELD_WIDTH / 2 - 2;
+        nCurrentY = 0;
+        nCurrentRotation = 0;
+        nCurrentPiece = nNextPiece;
+        nNextPiece = GetNextTetromino();
+        bCanHold = true;
+
+        // 6. Check Game Over condition
+        if (!DoesPieceFit(nCurrentPiece, nCurrentRotation, nCurrentX, nCurrentY)) {
+            bGameOver = true;
+        }
+    }
+
     void RenderFrame() {
         if (nScreenWidth <= 0 || nScreenHeight <= 0 || screen.empty()) return;
 
@@ -210,21 +462,29 @@ private:
             for (int y = 0; y < FIELD_HEIGHT; y++)
                 pField[y * FIELD_WIDTH + x] = (x == 0 || x == FIELD_WIDTH - 1 || y == FIELD_HEIGHT - 1) ? 9 : 0;
 
-        nCurrentPiece = rand() % 7;
-        nNextPiece = rand() % 7;
+        bagIndex = 7;
+        nCurrentPiece = GetNextTetromino();
+        nNextPiece = GetNextTetromino();
         nHoldPiece = -1;
         bCanHold = true;
+        bHoldKeyHold = true;
+        bSpaceKeyHold = true;
+        bPauseKeyHold = true;
+        bRotateHold = true;
+        nLeftHoldCount = 0;
+        nRightHoldCount = 0;
+
         nCurrentRotation = 0;
         nCurrentX = FIELD_WIDTH / 2 - 2;
         nCurrentY = 0;
         nSpeed = 20;
         nSpeedCount = 0;
-        bRotateHold = true;
         nPieceCount = 0;
         nLinesCleared = 0;
         nScore = 0;
         bGameOver = false;
         bPaused = false;
+        vLines.clear();
     }
 
 public:
@@ -259,6 +519,7 @@ public:
         if (hConsole) {
             SetConsoleActiveScreenBuffer(hOriginalConsole);
             CloseHandle(hConsole);
+            hConsole = NULL;
         }
     }
 
@@ -280,14 +541,13 @@ public:
 
                 UpdateTerminalDimensions();
 
-                // Clear screen buffer
-                CHAR_INFO emptyCell;
-                emptyCell.Char.UnicodeChar = L' ';
-                emptyCell.Attributes = COLOR_WHITE;
-                fill(screen.begin(), screen.end(), emptyCell);
-
                 // Minimum terminal size check
                 if (nScreenWidth < MIN_LAYOUT_WIDTH || nScreenHeight < MIN_LAYOUT_HEIGHT) {
+                    CHAR_INFO emptyCell;
+                    emptyCell.Char.UnicodeChar = L' ';
+                    emptyCell.Attributes = COLOR_WHITE;
+                    fill(screen.begin(), screen.end(), emptyCell);
+
                     int warnY = max(0, nScreenHeight / 2 - 3);
                     int warnX = max(0, (nScreenWidth - 32) / 2);
                     DrawString(warnX, warnY,     L"+------------------------------+", COLOR_YELLOW);
@@ -315,12 +575,18 @@ public:
                     if (bPauseKeyHold) {
                         bPaused = !bPaused;
                         bPauseKeyHold = false;
+                        t1 = chrono::system_clock::now();
                     }
                 } else {
                     bPauseKeyHold = true;
                 }
 
                 if (bPaused) {
+                    CHAR_INFO emptyCell;
+                    emptyCell.Char.UnicodeChar = L' ';
+                    emptyCell.Attributes = COLOR_WHITE;
+                    fill(screen.begin(), screen.end(), emptyCell);
+
                     int centerY = max(0, nScreenHeight / 2 - 2);
                     int centerX = max(0, (nScreenWidth - 32) / 2);
                     DrawString(centerX, centerY,     L"+------------------------------+", COLOR_CYAN);
@@ -340,19 +606,34 @@ public:
                 bool bHoldPressed = ((0x8000 & GetAsyncKeyState('C')) || (0x8000 & GetAsyncKeyState('H'))) != 0;
                 if (bHoldPressed) {
                     if (bHoldKeyHold && bCanHold) {
+                        int nextCur;
                         if (nHoldPiece == -1) {
                             nHoldPiece = nCurrentPiece;
-                            nCurrentPiece = nNextPiece;
-                            nNextPiece = rand() % 7;
+                            nextCur = nNextPiece;
+                            nNextPiece = GetNextTetromino();
                         } else {
-                            int temp = nCurrentPiece;
-                            nCurrentPiece = nHoldPiece;
-                            nHoldPiece = temp;
+                            nextCur = nHoldPiece;
+                            nHoldPiece = nCurrentPiece;
                         }
-                        nCurrentX = FIELD_WIDTH / 2 - 2;
-                        nCurrentY = 0;
-                        nCurrentRotation = 0;
-                        bCanHold = false;
+                        int testX = FIELD_WIDTH / 2 - 2;
+                        int testY = 0;
+                        int testRot = 0;
+                        if (DoesPieceFit(nextCur, testRot, testX, testY)) {
+                            nCurrentPiece = nextCur;
+                            nCurrentX = testX;
+                            nCurrentY = testY;
+                            nCurrentRotation = testRot;
+                            bCanHold = false;
+                            nSpeedCount = 0;
+                        } else {
+                            nCurrentPiece = nextCur;
+                            nCurrentX = testX;
+                            nCurrentY = testY;
+                            nCurrentRotation = testRot;
+                            bCanHold = false;
+                            bGameOver = true;
+                            break;
+                        }
                         bHoldKeyHold = false;
                     }
                 } else {
@@ -360,8 +641,8 @@ public:
                 }
 
                 // Hard Drop (Space)
-                bool bSpacePressed = (0x8000 & GetAsyncKeyState(VK_SPACE)) != 0;
                 bool bHardDropped = false;
+                bool bSpacePressed = (0x8000 & GetAsyncKeyState(VK_SPACE)) != 0;
                 if (bSpacePressed) {
                     if (bSpaceKeyHold) {
                         int dropDist = 0;
@@ -370,6 +651,10 @@ public:
                             dropDist++;
                         }
                         nScore += dropDist * 2;
+                        if (nScore > nHighScore) {
+                            nHighScore = nScore;
+                            SaveHighScore(nHighScore);
+                        }
                         bHardDropped = true;
                         bSpaceKeyHold = false;
                     }
@@ -377,268 +662,133 @@ public:
                     bSpaceKeyHold = true;
                 }
 
-                nSpeedCount++;
-                bool bForceDown = (nSpeedCount >= nSpeed) || bHardDropped;
-
-                // Input handling: Arrows / WASD
-                bKey[0] = ((0x8000 & GetAsyncKeyState(VK_RIGHT)) || (0x8000 & GetAsyncKeyState('D'))) != 0;
-                bKey[1] = ((0x8000 & GetAsyncKeyState(VK_LEFT))  || (0x8000 & GetAsyncKeyState('A'))) != 0;
-                bKey[2] = ((0x8000 & GetAsyncKeyState(VK_DOWN))  || (0x8000 & GetAsyncKeyState('S'))) != 0;
-                bKey[3] = ((0x8000 & GetAsyncKeyState(VK_UP))    || (0x8000 & GetAsyncKeyState('W')) ||
-                           (0x8000 & GetAsyncKeyState('Z'))) != 0;
-
                 if ((0x8000 & GetAsyncKeyState('Q')) || (0x8000 & GetAsyncKeyState(VK_ESCAPE))) {
                     bExitApp = true;
                     break;
                 }
 
-                // Lateral and vertical soft movement
-                nCurrentX += (bKey[0] && DoesPieceFit(nCurrentPiece, nCurrentRotation, nCurrentX + 1, nCurrentY)) ? 1 : 0;
-                nCurrentX -= (bKey[1] && DoesPieceFit(nCurrentPiece, nCurrentRotation, nCurrentX - 1, nCurrentY)) ? 1 : 0;
-                if (bKey[2] && DoesPieceFit(nCurrentPiece, nCurrentRotation, nCurrentX, nCurrentY + 1)) {
-                    nCurrentY++;
-                    nScore += 1;
-                }
-
-                // Rotation with Wall Kick attempt
-                if (bKey[3]) {
-                    if (bRotateHold) {
-                        if (DoesPieceFit(nCurrentPiece, nCurrentRotation + 1, nCurrentX, nCurrentY)) {
-                            nCurrentRotation++;
-                        } else if (DoesPieceFit(nCurrentPiece, nCurrentRotation + 1, nCurrentX - 1, nCurrentY)) {
-                            nCurrentX--; nCurrentRotation++; // Wall kick left
-                        } else if (DoesPieceFit(nCurrentPiece, nCurrentRotation + 1, nCurrentX + 1, nCurrentY)) {
-                            nCurrentX++; nCurrentRotation++; // Wall kick right
-                        }
-                        bRotateHold = false;
-                    }
+                if (bHardDropped) {
+                    // Hard drop directly locks the piece in position
+                    LockPieceAndSpawn();
                 } else {
-                    bRotateHold = true;
-                }
+                    // Lateral movement with DAS (Delayed Auto Shift)
+                    bool bLeftKey = ((0x8000 & GetAsyncKeyState(VK_LEFT)) || (0x8000 & GetAsyncKeyState('A'))) != 0;
+                    bool bRightKey = ((0x8000 & GetAsyncKeyState(VK_RIGHT)) || (0x8000 & GetAsyncKeyState('D'))) != 0;
 
-                if (bForceDown) {
-                    nSpeedCount = 0;
-                    nPieceCount++;
-                    if (nPieceCount % 50 == 0)
-                        if (nSpeed >= 10) nSpeed--;
-
-                    if (DoesPieceFit(nCurrentPiece, nCurrentRotation, nCurrentX, nCurrentY + 1))
-                        nCurrentY++;
-                    else {
-                        // Lock piece into field
-                        for (int px = 0; px < 4; px++)
-                            for (int py = 0; py < 4; py++)
-                                if (tetromino[nCurrentPiece][Rotate(px, py, nCurrentRotation)] != L'.')
-                                    pField[(nCurrentY + py) * FIELD_WIDTH + (nCurrentX + px)] = nCurrentPiece + 1;
-
-                        // Check for completed lines
-                        for (int py = 0; py < 4; py++)
-                            if (nCurrentY + py < FIELD_HEIGHT - 1) {
-                                bool bLine = true;
-                                for (int px = 1; px < FIELD_WIDTH - 1; px++)
-                                    bLine &= (pField[(nCurrentY + py) * FIELD_WIDTH + px]) != 0;
-
-                                if (bLine) {
-                                    for (int px = 1; px < FIELD_WIDTH - 1; px++)
-                                        pField[(nCurrentY + py) * FIELD_WIDTH + px] = 8;
-                                    vLines.push_back(nCurrentY + py);
-                                }
-                            }
-
-                        nScore += 25;
-                        if (!vLines.empty()) {
-                            nScore += (1 << vLines.size()) * 100;
-                            nLinesCleared += static_cast<int>(vLines.size());
+                    if (bLeftKey) {
+                        if (nLeftHoldCount == 0 || (nLeftHoldCount >= 4 && nLeftHoldCount % 2 == 0)) {
+                            if (DoesPieceFit(nCurrentPiece, nCurrentRotation, nCurrentX - 1, nCurrentY))
+                                nCurrentX--;
                         }
-
-                        if (nScore > nHighScore) {
-                            nHighScore = nScore;
-                            SaveHighScore(nHighScore);
-                        }
-
-                        // Spawn next piece
-                        nCurrentX = FIELD_WIDTH / 2 - 2;
-                        nCurrentY = 0;
-                        nCurrentRotation = 0;
-                        nCurrentPiece = nNextPiece;
-                        nNextPiece = rand() % 7;
-                        bCanHold = true;
-
-                        bGameOver = !DoesPieceFit(nCurrentPiece, nCurrentRotation, nCurrentX, nCurrentY);
+                        nLeftHoldCount++;
+                    } else {
+                        nLeftHoldCount = 0;
                     }
-                }
 
-                // Layout calculations (double width tiles: 2 cols per board unit)
-                int boardCharWidth = FIELD_WIDTH * 2;
-                int totalLayoutWidth = boardCharWidth + 3 + 24; // ~51 cols
-                int totalLayoutHeight = FIELD_HEIGHT;           // 18 rows
-                int nOffsetX = max(1, (nScreenWidth - totalLayoutWidth) / 2);
-                int nOffsetY = max(1, (nScreenHeight - totalLayoutHeight) / 2);
+                    if (bRightKey) {
+                        if (nRightHoldCount == 0 || (nRightHoldCount >= 4 && nRightHoldCount % 2 == 0)) {
+                            if (DoesPieceFit(nCurrentPiece, nCurrentRotation, nCurrentX + 1, nCurrentY))
+                                nCurrentX++;
+                        }
+                        nRightHoldCount++;
+                    } else {
+                        nRightHoldCount = 0;
+                    }
 
-                // Draw Field (walls and locked blocks)
-                for (int x = 0; x < FIELD_WIDTH; x++) {
-                    for (int y = 0; y < FIELD_HEIGHT; y++) {
-                        int sx = nOffsetX + x * 2;
-                        int sy = nOffsetY + y;
-                        unsigned char val = pField[y * FIELD_WIDTH + x];
-
-                        if (val == 9) { // Border wall
-                            if (y == FIELD_HEIGHT - 1) {
-                                DrawTile(sx, sy, L"==", COLOR_GRAY);
-                            } else if (x == 0) {
-                                DrawTile(sx, sy, L"<!", COLOR_GRAY);
-                            } else {
-                                DrawTile(sx, sy, L"!>", COLOR_GRAY);
+                    // Soft Drop (Down / S)
+                    bool bDownKey = ((0x8000 & GetAsyncKeyState(VK_DOWN)) || (0x8000 & GetAsyncKeyState('S'))) != 0;
+                    if (bDownKey) {
+                        if (DoesPieceFit(nCurrentPiece, nCurrentRotation, nCurrentX, nCurrentY + 1)) {
+                            nCurrentY++;
+                            nScore += 1;
+                            nSpeedCount = 0;
+                            if (nScore > nHighScore) {
+                                nHighScore = nScore;
+                                SaveHighScore(nHighScore);
                             }
-                        } else if (val == 8) { // Line clear flash
-                            DrawTile(sx, sy, L"==", COLOR_WHITE);
-                        } else if (val >= 1 && val <= 7) { // Locked piece
-                            DrawTile(sx, sy, L"[]", PIECE_COLORS[val - 1]);
+                        }
+                    }
+
+                    // Rotation with Wall Kicks & Floor Kick
+                    bool bRotateKey = ((0x8000 & GetAsyncKeyState(VK_UP)) || (0x8000 & GetAsyncKeyState('W')) ||
+                                       (0x8000 & GetAsyncKeyState('Z'))) != 0;
+                    if (bRotateKey) {
+                        if (bRotateHold) {
+                            int nextRot = (nCurrentRotation + 1) % 4;
+                            if (DoesPieceFit(nCurrentPiece, nextRot, nCurrentX, nCurrentY)) {
+                                nCurrentRotation = nextRot;
+                            } else if (DoesPieceFit(nCurrentPiece, nextRot, nCurrentX - 1, nCurrentY)) {
+                                nCurrentX -= 1; nCurrentRotation = nextRot; // Wall kick left
+                            } else if (DoesPieceFit(nCurrentPiece, nextRot, nCurrentX + 1, nCurrentY)) {
+                                nCurrentX += 1; nCurrentRotation = nextRot; // Wall kick right
+                            } else if (DoesPieceFit(nCurrentPiece, nextRot, nCurrentX - 2, nCurrentY)) {
+                                nCurrentX -= 2; nCurrentRotation = nextRot; // Wall kick left 2 (I piece)
+                            } else if (DoesPieceFit(nCurrentPiece, nextRot, nCurrentX + 2, nCurrentY)) {
+                                nCurrentX += 2; nCurrentRotation = nextRot; // Wall kick right 2 (I piece)
+                            } else if (DoesPieceFit(nCurrentPiece, nextRot, nCurrentX, nCurrentY - 1)) {
+                                nCurrentY -= 1; nCurrentRotation = nextRot; // Floor kick up
+                            }
+                            bRotateHold = false;
+                        }
+                    } else {
+                        bRotateHold = true;
+                    }
+
+                    // Gravity
+                    nSpeedCount++;
+                    if (nSpeedCount >= nSpeed) {
+                        nSpeedCount = 0;
+                        if (DoesPieceFit(nCurrentPiece, nCurrentRotation, nCurrentX, nCurrentY + 1)) {
+                            nCurrentY++;
                         } else {
-                            DrawTile(sx, sy, L"  ", COLOR_BLACK);
+                            LockPieceAndSpawn();
                         }
                     }
-                }
-
-                // Draw Ghost Piece (Shadow)
-                int nGhostY = nCurrentY;
-                while (DoesPieceFit(nCurrentPiece, nCurrentRotation, nCurrentX, nGhostY + 1)) {
-                    nGhostY++;
-                }
-
-                if (nGhostY > nCurrentY) {
-                    for (int px = 0; px < 4; px++) {
-                        for (int py = 0; py < 4; py++) {
-                            if (tetromino[nCurrentPiece][Rotate(px, py, nCurrentRotation)] != L'.') {
-                                int sx = nOffsetX + (nCurrentX + px) * 2;
-                                int sy = nOffsetY + (nGhostY + py);
-                                DrawTile(sx, sy, L"::", COLOR_DARK_GRAY);
-                            }
-                        }
-                    }
-                }
-
-                // Draw Active Piece
-                for (int px = 0; px < 4; px++) {
-                    for (int py = 0; py < 4; py++) {
-                        if (tetromino[nCurrentPiece][Rotate(px, py, nCurrentRotation)] != L'.') {
-                            int sx = nOffsetX + (nCurrentX + px) * 2;
-                            int sy = nOffsetY + (nCurrentY + py);
-                            DrawTile(sx, sy, L"[]", PIECE_COLORS[nCurrentPiece]);
-                        }
-                    }
-                }
-
-                // Draw Side HUD
-                int hudX = nOffsetX + boardCharWidth + 3;
-                int hudY = nOffsetY;
-
-                DrawString(hudX, hudY,     L"========================", COLOR_CYAN);
-                DrawString(hudX, hudY + 1, L"     T E T R I S        ", COLOR_YELLOW);
-                DrawString(hudX, hudY + 2, L"========================", COLOR_CYAN);
-
-                wchar_t szInfo[32];
-                wsprintfW(szInfo, L"HIGH:  %8d", nHighScore);
-                DrawString(hudX, hudY + 4, szInfo, COLOR_YELLOW);
-
-                wsprintfW(szInfo, L"SCORE: %8d", nScore);
-                DrawString(hudX, hudY + 5, szInfo, COLOR_WHITE);
-
-                wsprintfW(szInfo, L"LINES: %8d", nLinesCleared);
-                DrawString(hudX, hudY + 6, szInfo, COLOR_GREEN);
-
-                wsprintfW(szInfo, L"SPEED: %8d", 21 - nSpeed);
-                DrawString(hudX, hudY + 7, szInfo, COLOR_CYAN);
-
-                // NEXT Piece Box
-                DrawString(hudX, hudY + 9, L"NEXT: ", COLOR_WHITE);
-                for (int px = 0; px < 4; px++) {
-                    for (int py = 0; py < 2; py++) {
-                        int sx = hudX + 7 + px * 2;
-                        int sy = hudY + 9 + py;
-                        if (tetromino[nNextPiece][py * 4 + px] != L'.') {
-                            DrawTile(sx, sy, L"[]", PIECE_COLORS[nNextPiece]);
-                        } else {
-                            DrawTile(sx, sy, L"  ", COLOR_BLACK);
-                        }
-                    }
-                }
-
-                // HOLD Piece Box
-                DrawString(hudX, hudY + 11, L"HOLD: ", COLOR_WHITE);
-                if (nHoldPiece != -1) {
-                    for (int px = 0; px < 4; px++) {
-                        for (int py = 0; py < 2; py++) {
-                            int sx = hudX + 7 + px * 2;
-                            int sy = hudY + 11 + py;
-                            if (tetromino[nHoldPiece][py * 4 + px] != L'.') {
-                                DrawTile(sx, sy, L"[]", PIECE_COLORS[nHoldPiece]);
-                            } else {
-                                DrawTile(sx, sy, L"  ", COLOR_BLACK);
-                            }
-                        }
-                    }
-                } else {
-                    DrawString(hudX + 7, hudY + 11, L"[NONE]", COLOR_DARK_GRAY);
-                }
-
-                DrawString(hudX, hudY + 13, L"------------------------", COLOR_DARK_GRAY);
-                DrawString(hudX, hudY + 14, L"A/D / <-/-> : Move", COLOR_WHITE);
-                DrawString(hudX, hudY + 15, L"S / DOWN    : Soft Drop", COLOR_WHITE);
-                DrawString(hudX, hudY + 16, L"SPACE       : Hard Drop", COLOR_YELLOW);
-                DrawString(hudX, hudY + 17, L"W / UP / Z  : Rotate", COLOR_WHITE);
-                DrawString(hudX, hudY + 18, L"C / H       : Hold Piece", COLOR_CYAN);
-                DrawString(hudX, hudY + 19, L"P           : Pause", COLOR_WHITE);
-                DrawString(hudX, hudY + 20, L"Q / ESC     : Quit", COLOR_RED);
-                DrawString(hudX, hudY + 21, L"------------------------", COLOR_DARK_GRAY);
-
-                // Animate Line Completion
-                if (!vLines.empty()) {
-                    RenderFrame();
-                    Sleep(300);
-
-                    for (auto& v : vLines)
-                        for (int px = 1; px < FIELD_WIDTH - 1; px++) {
-                            for (int py = v; py > 0; py--)
-                                pField[py * FIELD_WIDTH + px] = pField[(py - 1) * FIELD_WIDTH + px];
-                            pField[px] = 0;
-                        }
-
-                    vLines.clear();
                 }
 
                 // Render current frame
+                DrawGameScene(true);
                 RenderFrame();
             }
 
             if (bExitApp) break;
+
+            // Update high score one final time on game over
+            if (nScore > nHighScore) {
+                nHighScore = nScore;
+                SaveHighScore(nHighScore);
+            }
 
             // Game Over Screen
             CHAR_INFO emptyCell;
             emptyCell.Char.UnicodeChar = L' ';
             emptyCell.Attributes = COLOR_WHITE;
             fill(screen.begin(), screen.end(), emptyCell);
-            int goY = max(0, nScreenHeight / 2 - 4);
-            int goX = max(0, (nScreenWidth - 32) / 2);
-            DrawString(goX, goY,     L"$------------------------------$", COLOR_RED);
-            DrawString(goX, goY + 1, L"|         GAME OVER!           |", COLOR_RED);
+
+            int goY = max(0, nScreenHeight / 2 - 5);
+            int goX = max(0, (nScreenWidth - 34) / 2);
+            DrawString(goX, goY,     L"+--------------------------------+", COLOR_RED);
+            DrawString(goX, goY + 1, L"|          GAME OVER!            |", COLOR_RED);
+            DrawString(goX, goY + 2, L"+--------------------------------+", COLOR_RED);
             wchar_t szFinal[40];
-            wsprintfW(szFinal, L"|   Final Score: %-13d |", nScore);
-            DrawString(goX, goY + 2, szFinal, COLOR_YELLOW);
-            wsprintfW(szFinal, L"|   High Score:  %-13d |", nHighScore);
-            DrawString(goX, goY + 3, szFinal, COLOR_CYAN);
-            wsprintfW(szFinal, L"|   Lines:       %-13d |", nLinesCleared);
-            DrawString(goX, goY + 4, szFinal, COLOR_GREEN);
-            DrawString(goX, goY + 5, L"|                              |", COLOR_WHITE);
-            DrawString(goX, goY + 6, L"|  'R' to Play Again           |", COLOR_WHITE);
-            DrawString(goX, goY + 7, L"|  'Q' to Quit                 |", COLOR_WHITE);
-            DrawString(goX, goY + 8, L"$------------------------------$", COLOR_RED);
+            wsprintfW(szFinal,       L"|  Final Score:   %-14d |", nScore);
+            DrawString(goX, goY + 3, szFinal, COLOR_YELLOW);
+            wsprintfW(szFinal,       L"|  High Score:    %-14d |", nHighScore);
+            DrawString(goX, goY + 4, szFinal, COLOR_CYAN);
+            wsprintfW(szFinal,       L"|  Lines Cleared: %-14d |", nLinesCleared);
+            DrawString(goX, goY + 5, szFinal, COLOR_GREEN);
+            DrawString(goX, goY + 6, L"|                                |", COLOR_WHITE);
+            DrawString(goX, goY + 7, L"|  Press 'R' to Play Again       |", COLOR_WHITE);
+            DrawString(goX, goY + 8, L"|  Press 'Q' to Quit             |", COLOR_WHITE);
+            DrawString(goX, goY + 9, L"+--------------------------------+", COLOR_RED);
             RenderFrame();
 
             // Wait for R to restart or Q to quit
-            while (true) {
+            while (!bExitApp) {
                 Sleep(20);
+                UpdateTerminalDimensions();
                 if ((0x8000 & GetAsyncKeyState('R')) != 0) {
+                    while ((0x8000 & GetAsyncKeyState('R')) != 0) Sleep(10);
                     ResetGame();
                     break;
                 }
